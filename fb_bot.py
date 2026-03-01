@@ -2,6 +2,12 @@
 Facebook Messenger Bot Integration
 
 This module handles Facebook webhook integration for the RAG chatbot.
+
+Usage:
+1. Copy .env.example to .env
+2. Fill in FB credentials
+3. Configure webhook URL in Facebook Developer Console
+4. Run app.py
 """
 
 import os
@@ -10,18 +16,30 @@ from flask import request
 
 logger = logging.getLogger(__name__)
 
-# TODO: Load from .env
-FB_VERIFY_TOKEN = os.getenv('FB_VERIFY_TOKEN', 'YOUR_VERIFY_TOKEN')
-FB_PAGE_ACCESS_TOKEN = os.getenv('FB_PAGE_ACCESS_TOKEN', 'YOUR_ACCESS_TOKEN')
-FB_PAGE_ID = os.getenv('FB_PAGE_ID', 'YOUR_PAGE_ID')
+# Load from environment variables
+FB_VERIFY_TOKEN = os.getenv('FB_VERIFY_TOKEN', '')
+FB_PAGE_ACCESS_TOKEN = os.getenv('FB_PAGE_ACCESS_TOKEN', '')
+FB_PAGE_ID = os.getenv('FB_PAGE_ID', '')
+
+# Check if Facebook is configured
+FB_CONFIGURED = bool(FB_VERIFY_TOKEN and FB_PAGE_ACCESS_TOKEN and FB_PAGE_ID)
+
+if FB_CONFIGURED:
+    logger.info("Facebook Messenger bot configured and ready")
+else:
+    logger.info("Facebook Messenger not configured - set FB credentials in .env to enable")
 
 
 def send_fb_message(sender_id, message_text):
     """
     Send a message to a Facebook user via Graph API.
     
-    Graph API endpoint: POST https://graph.facebook.com/v18.0/me/messages
+    Requires FB_PAGE_ACCESS_TOKEN to be set in environment.
     """
+    if not FB_CONFIGURED:
+        logger.warning("Facebook not configured - message not sent")
+        return False
+    
     import requests
     
     url = f"https://graph.facebook.com/v18.0/me/messages?access_token={FB_PAGE_ACCESS_TOKEN}"
@@ -92,6 +110,10 @@ def setup_facebook_routes(app, rag_system):
     @app.route('/webhook', methods=['POST'])
     def facebook_webhook():
         """Facebook webhook to receive messages."""
+        if not FB_CONFIGURED:
+            logger.warning("Facebook webhook called but not configured")
+            return "Facebook not configured", 200
+        
         payload = request.get_json()
         
         if not payload or 'entry' not in payload:
