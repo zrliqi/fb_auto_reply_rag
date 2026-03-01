@@ -78,8 +78,8 @@ Open http://localhost:5000 in your browser.
 2. Add Messenger product
 3. Get Page Access Token
 4. Edit `.env` with your credentials
-5. Implement `send_fb_message()` in `fb_bot.py`
-6. Configure webhook URL (use ngrok for local testing)
+5. Configure webhook URL (use ngrok for local testing)
+6. See [FACEBOOK_SETUP.md](FACEBOOK_SETUP.md) for detailed instructions
 
 ---
 
