@@ -1,5 +1,7 @@
 from flask import Flask, render_template, request, redirect, url_for, flash, send_from_directory, jsonify
 import os
+import sqlite3
+import json
 import logging
 from werkzeug.utils import secure_filename
 from datetime import datetime
@@ -19,6 +21,48 @@ app = Flask(__name__)
 app.secret_key = 'supersecretkey'
 app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['ALLOWED_EXTENSIONS'] = {'txt', 'pdf', 'docx', 'md', 'pptx', 'csv'}
+
+# Database for user memories
+MEMORY_DB = 'user_memories.db'
+
+def get_memory_db():
+    conn = sqlite3.connect(MEMORY_DB)
+    return conn
+
+def init_memory_db():
+    conn = get_memory_db()
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS user_memories (
+            user_id TEXT PRIMARY KEY,
+            history TEXT NOT NULL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+init_memory_db()
+
+def save_user_memory(user_id, history):
+    conn = get_memory_db()
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT OR REPLACE INTO user_memories (user_id, history, updated_at)
+        VALUES (?, ?, ?)
+    ''', (user_id, json.dumps(history), datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+def load_user_memory(user_id):
+    conn = get_memory_db()
+    cursor = conn.cursor()
+    cursor.execute('SELECT history FROM user_memories WHERE user_id = ?', (user_id,))
+    result = cursor.fetchone()
+    conn.close()
+    if result:
+        return json.loads(result[0])
+    return []
 
 if not os.path.exists(app.config['UPLOAD_FOLDER']):
     os.makedirs(app.config['UPLOAD_FOLDER'])
@@ -121,13 +165,7 @@ class RAGSystem:
     def __init__(self, llm_model="qwen2.5:3b", embed_model="bge-m3:latest"):
         self.embeddings = OllamaEmbeddings(model=embed_model)
         self.vector_store = None
-        self.qa_chain = None
         self.llm = OllamaLLM(model=llm_model, temperature=0.1)
-        self.memory = ConversationBufferMemory(
-            memory_key="chat_history",
-            output_key="answer",
-            return_messages=True
-        )
         logging.info(f"Initializing RAG system with {llm_model}...")
         self.load_documents()
         self.initialize_chain()
@@ -137,6 +175,57 @@ class RAGSystem:
         self.load_documents()
         self.initialize_chain()
         logging.info("Knowledge base reloaded")
+    
+    def query(self, message, user_id="default"):
+        if not message:
+            return {"error": "No message provided"}, 400
+        
+        if not self.vector_store:
+            return {"response": "No documents available for knowledge base. Please upload documents first."}
+        
+        try:
+            # Load user-specific memory from database
+            history = load_user_memory(user_id)
+            
+            # Create memory with history
+            memory = ConversationBufferMemory(
+                memory_key="chat_history",
+                output_key="answer",
+                return_messages=True
+            )
+            
+            # Load history into memory
+            for msg in history:
+                if msg['type'] == 'human':
+                    memory.chat_memory.add_user_message(msg['content'])
+                elif msg['type'] == 'ai':
+                    memory.chat_memory.add_ai_message(msg['content'])
+            
+            # Create chain with user memory
+            qa_chain = ConversationalRetrievalChain.from_llm(
+                llm=self.llm,
+                retriever=self.vector_store.as_retriever(),
+                memory=memory,
+                return_source_documents=True,
+                verbose=False
+            )
+            
+            # Query
+            result = qa_chain.invoke(message)
+            
+            # Save updated memory to database
+            updated_history = [
+                {"type": "human", "content": message},
+                {"type": "ai", "content": result.get('answer', str(result))}
+            ]
+            save_user_memory(user_id, history + updated_history)
+            
+            logging.info(f"Query processed for user {user_id}: {message[:30]}...")
+            return {"response": result.get('answer', str(result))}
+            
+        except Exception as e:
+            logging.error(f"Query error: {e}")
+            return {"response": f"Error processing your query: {str(e)}"}, 500
     
     def load_documents(self):
         if not os.path.exists(app.config['UPLOAD_FOLDER']):
@@ -183,34 +272,8 @@ class RAGSystem:
         return documents
     
     def initialize_chain(self):
-        if self.vector_store:
-            try:
-                self.qa_chain = ConversationalRetrievalChain.from_llm(
-                    llm=self.llm,
-                    retriever=self.vector_store.as_retriever(),
-                    memory=self.memory,
-                    return_source_documents=True,
-                    verbose=True
-                )
-                logging.info("Conversational RAG chain initialized")
-            except Exception as e:
-                logging.error(f"Error initializing RAG chain: {e}")
-                self.qa_chain = None
-    
-    def query(self, message):
-        if not message:
-            return {"error": "No message provided"}, 400
-        
-        if self.qa_chain:
-            try:
-                result = self.qa_chain.invoke(message)
-                logging.info(f"Query processed: {message[:30]}...")
-                return {"response": result.get('answer', str(result))}
-            except Exception as e:
-                logging.error(f"Query error: {e}")
-                return {"response": f"Error processing your query: {str(e)}"}, 500
-        else:
-            return {"response": "No documents available for knowledge base. Please upload documents first."}
+        # Chain is now created per-query with user memory
+        pass
 
 rag_system = RAGSystem()
 
@@ -218,7 +281,8 @@ rag_system = RAGSystem()
 def chat():
     data = request.get_json()
     message = data.get('message', "")
-    return jsonify(rag_system.query(message))
+    user_id = data.get('user_id', "default")
+    return jsonify(rag_system.query(message, user_id))
 
 @app.route('/api/messages', methods=['GET'])
 def get_messages():
@@ -232,6 +296,100 @@ def reload_knowledge_base():
     except Exception as e:
         logging.error(f"Reload error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
+
+# ============================================
+# Facebook Webhook Skeleton
+# ============================================
+
+# TODO: Load from .env
+FB_VERIFY_TOKEN = os.getenv('FB_VERIFY_TOKEN', 'YOUR_VERIFY_TOKEN')
+FB_PAGE_ACCESS_TOKEN = os.getenv('FB_PAGE_ACCESS_TOKEN', 'YOUR_ACCESS_TOKEN')
+FB_PAGE_ID = os.getenv('FB_PAGE_ID', 'YOUR_PAGE_ID')
+
+def send_fb_message(sender_id, message_text):
+    """
+    TODO: Implement Facebook Graph API call to send message.
+    
+    Graph API endpoint: POST https://graph.facebook.com/v18.0/me/messages
+    Parameters:
+    - access_token: FB_PAGE_ACCESS_TOKEN
+    - recipient: {"id": sender_id}
+    - message: {"text": message_text}
+    
+    Example using requests:
+    import requests
+    url = f"https://graph.facebook.com/v18.0/me/messages?access_token={FB_PAGE_ACCESS_TOKEN}"
+    data = {
+        "recipient": {"id": sender_id},
+        "message": {"text": message_text}
+    }
+    requests.post(url, json=data)
+    """
+    logging.info(f"[FB SKELETON] Would send to {sender_id}: {message_text}")
+    return True
+
+def get_fb_sender_id(payload):
+    """
+    Extract sender ID from Facebook webhook payload.
+    """
+    try:
+        entry = payload.get('entry', [])[0]
+        messaging = entry.get('messaging', [])[0]
+        return messaging.get('sender', {}).get('id')
+    except (IndexError, KeyError):
+        return None
+
+def get_fb_message_text(payload):
+    """
+    Extract message text from Facebook webhook payload.
+    """
+    try:
+        entry = payload.get('entry', [])[0]
+        messaging = entry.get('messaging', [])[0]
+        return messaging.get('message', {}).get('text', '')
+    except (IndexError, KeyError):
+        return None
+
+@app.route('/webhook', methods=['GET'])
+def facebook_verify():
+    """
+    Facebook webhook verification endpoint.
+    """
+    mode = request.args.get('hub.mode')
+    token = request.args.get('hub.verify_token')
+    challenge = request.args.get('hub.challenge')
+    
+    if mode == 'subscribe' and token == FB_VERIFY_TOKEN:
+        logging.info("Facebook webhook verified")
+        return challenge, 200
+    else:
+        logging.warning("Facebook webhook verification failed")
+        return "Verification failed", 403
+
+@app.route('/webhook', methods=['POST'])
+def facebook_webhook():
+    """
+    Facebook webhook to receive messages.
+    """
+    payload = request.get_json()
+    
+    if not payload or 'entry' not in payload:
+        return "OK", 200
+    
+    sender_id = get_fb_sender_id(payload)
+    message_text = get_fb_message_text(payload)
+    
+    if sender_id and message_text:
+        logging.info(f"Received from {sender_id}: {message_text}")
+        
+        # Query RAG system with user-specific memory
+        response = rag_system.query(message_text, user_id=sender_id)
+        reply_text = response.get('response', 'Sorry, I could not process your request.')
+        
+        # Send reply via Facebook
+        send_fb_message(sender_id, reply_text)
+    
+    return "OK", 200
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
