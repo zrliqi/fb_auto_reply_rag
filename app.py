@@ -17,6 +17,8 @@ from langchain_community.vectorstores import Chroma
 from langchain_community.document_loaders import TextLoader, PyPDFLoader, Docx2txtLoader, CSVLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
+import fb_bot
+
 app = Flask(__name__)
 app.secret_key = 'supersecretkey'
 app.config['UPLOAD_FOLDER'] = 'uploads'
@@ -176,7 +178,15 @@ class RAGSystem:
         self.initialize_chain()
         logging.info("Knowledge base reloaded")
     
-    def query(self, message, user_id="default"):
+    def query(self, message, user_id=None):
+        """
+        Query the RAG system.
+        
+        Args:
+            message: User message
+            user_id: If provided, loads/persists conversation memory in SQLite.
+                     If None, uses fresh memory (no persistence) - for web chat.
+        """
         if not message:
             return {"error": "No message provided"}, 400
         
@@ -184,8 +194,8 @@ class RAGSystem:
             return {"response": "No documents available for knowledge base. Please upload documents first."}
         
         try:
-            # Load user-specific memory from database
-            history = load_user_memory(user_id)
+            # Load user-specific memory from database (only if user_id provided)
+            history = load_user_memory(user_id) if user_id else []
             
             # Create memory with history
             memory = ConversationBufferMemory(
@@ -213,14 +223,15 @@ class RAGSystem:
             # Query
             result = qa_chain.invoke(message)
             
-            # Save updated memory to database
-            updated_history = [
-                {"type": "human", "content": message},
-                {"type": "ai", "content": result.get('answer', str(result))}
-            ]
-            save_user_memory(user_id, history + updated_history)
+            # Save updated memory to database (only if user_id provided)
+            if user_id:
+                updated_history = [
+                    {"type": "human", "content": message},
+                    {"type": "ai", "content": result.get('answer', str(result))}
+                ]
+                save_user_memory(user_id, history + updated_history)
             
-            logging.info(f"Query processed for user {user_id}: {message[:30]}...")
+            logging.info(f"Query processed for user {user_id or 'web'}: {message[:30]}...")
             return {"response": result.get('answer', str(result))}
             
         except Exception as e:
@@ -281,8 +292,8 @@ rag_system = RAGSystem()
 def chat():
     data = request.get_json()
     message = data.get('message', "")
-    user_id = data.get('user_id', "default")
-    return jsonify(rag_system.query(message, user_id))
+    # Web chat doesn't save memory - fresh conversation each time
+    return jsonify(rag_system.query(message, user_id=None))
 
 @app.route('/api/messages', methods=['GET'])
 def get_messages():
@@ -297,99 +308,8 @@ def reload_knowledge_base():
         logging.error(f"Reload error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
-# ============================================
-# Facebook Webhook Skeleton
-# ============================================
-
-# TODO: Load from .env
-FB_VERIFY_TOKEN = os.getenv('FB_VERIFY_TOKEN', 'YOUR_VERIFY_TOKEN')
-FB_PAGE_ACCESS_TOKEN = os.getenv('FB_PAGE_ACCESS_TOKEN', 'YOUR_ACCESS_TOKEN')
-FB_PAGE_ID = os.getenv('FB_PAGE_ID', 'YOUR_PAGE_ID')
-
-def send_fb_message(sender_id, message_text):
-    """
-    TODO: Implement Facebook Graph API call to send message.
-    
-    Graph API endpoint: POST https://graph.facebook.com/v18.0/me/messages
-    Parameters:
-    - access_token: FB_PAGE_ACCESS_TOKEN
-    - recipient: {"id": sender_id}
-    - message: {"text": message_text}
-    
-    Example using requests:
-    import requests
-    url = f"https://graph.facebook.com/v18.0/me/messages?access_token={FB_PAGE_ACCESS_TOKEN}"
-    data = {
-        "recipient": {"id": sender_id},
-        "message": {"text": message_text}
-    }
-    requests.post(url, json=data)
-    """
-    logging.info(f"[FB SKELETON] Would send to {sender_id}: {message_text}")
-    return True
-
-def get_fb_sender_id(payload):
-    """
-    Extract sender ID from Facebook webhook payload.
-    """
-    try:
-        entry = payload.get('entry', [])[0]
-        messaging = entry.get('messaging', [])[0]
-        return messaging.get('sender', {}).get('id')
-    except (IndexError, KeyError):
-        return None
-
-def get_fb_message_text(payload):
-    """
-    Extract message text from Facebook webhook payload.
-    """
-    try:
-        entry = payload.get('entry', [])[0]
-        messaging = entry.get('messaging', [])[0]
-        return messaging.get('message', {}).get('text', '')
-    except (IndexError, KeyError):
-        return None
-
-@app.route('/webhook', methods=['GET'])
-def facebook_verify():
-    """
-    Facebook webhook verification endpoint.
-    """
-    mode = request.args.get('hub.mode')
-    token = request.args.get('hub.verify_token')
-    challenge = request.args.get('hub.challenge')
-    
-    if mode == 'subscribe' and token == FB_VERIFY_TOKEN:
-        logging.info("Facebook webhook verified")
-        return challenge, 200
-    else:
-        logging.warning("Facebook webhook verification failed")
-        return "Verification failed", 403
-
-@app.route('/webhook', methods=['POST'])
-def facebook_webhook():
-    """
-    Facebook webhook to receive messages.
-    """
-    payload = request.get_json()
-    
-    if not payload or 'entry' not in payload:
-        return "OK", 200
-    
-    sender_id = get_fb_sender_id(payload)
-    message_text = get_fb_message_text(payload)
-    
-    if sender_id and message_text:
-        logging.info(f"Received from {sender_id}: {message_text}")
-        
-        # Query RAG system with user-specific memory
-        response = rag_system.query(message_text, user_id=sender_id)
-        reply_text = response.get('response', 'Sorry, I could not process your request.')
-        
-        # Send reply via Facebook
-        send_fb_message(sender_id, reply_text)
-    
-    return "OK", 200
+# Setup Facebook webhook routes
+fb_bot.setup_facebook_routes(app, rag_system)
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
