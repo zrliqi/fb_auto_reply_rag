@@ -119,7 +119,7 @@ class RAGSystem:
                 retriever=self.vector_store.as_retriever(),
                 memory=memory,
                 return_source_documents=True,
-                verbose=False
+                verbose=True
             )
             
             # Query
