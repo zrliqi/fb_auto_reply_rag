@@ -8,12 +8,12 @@ import json
 import logging
 from datetime import datetime
 
-from langchain.chains.conversational_retrieval.base import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferMemory
+from langchain_classic.chains import ConversationalRetrievalChain
+from langchain_classic.memory import ConversationBufferMemory
 from langchain_ollama import OllamaLLM, OllamaEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_community.document_loaders import TextLoader, PyPDFLoader, Docx2txtLoader, CSVLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 logger = logging.getLogger(__name__)
 
