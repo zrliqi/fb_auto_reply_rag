@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: facebook-messenger-rag-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn wsgi:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 120
+    healthCheckPath: /health
+    envVars:
+      - key: LOG_LEVEL
+        value: INFO
+      - key: FB_GRAPH_API_VERSION
+        value: v20.0

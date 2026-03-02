@@ -1,135 +1,117 @@
-# RAG Chat Bot
+# Facebook Messenger Auto-Reply Bot (Production-Ready Flask + RAG Placeholder)
 
-A Facebook Page bot with RAG (Retrieval-Augmented Generation) capabilities. Uses local LLMs via Ollama.
+Production-oriented Messenger webhook bot with:
+- Flask app factory
+- `/webhook` GET verification
+- `/webhook` POST event handling
+- signature validation support (`X-Hub-Signature-256`)
+- modular services (Facebook client, AI responder, RAG retriever)
+- Gunicorn + Render deployment files
+- logging and error handling
 
-## Features
+## Project structure
 
-- **RAG-powered Q&A** - Answers questions from uploaded documents
-- **Multi-format support** - TXT, PDF, DOCX, CSV
-- **Multi-user memory** - Each Facebook user gets persistent conversation history
-- **Folder upload** - Upload entire folders at once
-- **Query refinement** - Understands follow-up questions ("he" → previous subject)
-- **Facebook Messenger integration** - Webhook skeleton ready
-
-## Requirements
-
-- Python 3.12+
-- Ollama running locally
-
-## Quick Start
-
-### 1. Install Ollama
-
-```bash
-# macOS/Linux
-curl -fsSL https://ollama.com/install.sh | sh
-
-# Start Ollama
-ollama serve
-
-# Pull required models
-ollama pull qwen2.5:3b
-ollama pull bge-m3:latest
+```text
+bot_app/
+  __init__.py
+  config.py
+  logging_config.py
+  routes/
+    webhook.py
+  services/
+    ai_service.py
+    facebook_client.py
+    rag_service.py
+data/
+  knowledge_base.txt
+.env.example
+Procfile
+render.yaml
+requirements.txt
+run.py
+wsgi.py
 ```
 
-### 2. Setup Python Environment
+## Environment variables
+
+Copy `.env.example` to `.env` and set:
+
+```env
+PORT=5000
+LOG_LEVEL=INFO
+FB_VERIFY_TOKEN=change_me_verify_token
+FB_PAGE_ACCESS_TOKEN=change_me_page_access_token
+FB_APP_SECRET=change_me_app_secret_optional
+FB_GRAPH_API_VERSION=v20.0
+WEBHOOK_TIMEOUT_SECONDS=10
+DEFAULT_REPLY=Thanks for your message. We will get back to you shortly.
+KB_FILE=data/knowledge_base.txt
+RAG_TOP_K=3
+```
+
+## Local run
 
 ```bash
-# Create virtual environment
 python -m venv .venv
+# Windows
+.venv\Scripts\activate
+# macOS/Linux
+# source .venv/bin/activate
 
-# Activate
-source .venv/bin/activate  # Linux/Mac
-.venv\Scripts\activate     # Windows
-
-# Install dependencies
 pip install -r requirements.txt
+python run.py
 ```
 
-### 3. Configure Environment
+## Webhook endpoints
+
+- `GET /webhook`: Meta verification (`hub.verify_token` check)
+- `POST /webhook`: receives page messaging events and replies
+- `GET /health`: health probe
+
+## AI response placeholder
+
+Current placeholder is in:
+- `bot_app/services/ai_service.py` -> `_call_ai_model(...)`
+
+Replace this method with your real model/provider call (OpenAI, Claude, local model, etc).
+
+## RAG support
+
+Current RAG is a lightweight retriever against `data/knowledge_base.txt`.
+For production, replace `RAGService.retrieve(...)` with a real vector store retriever.
+
+## Gunicorn compatibility
+
+WSGI entrypoint:
+- `wsgi.py` exposes `app`
+
+Run manually:
 
 ```bash
-# Copy environment template
-cp .env.example .env
-
-# Edit .env (optional - for Facebook integration)
+gunicorn wsgi:app --bind 0.0.0.0:5000 --workers 2 --threads 4 --timeout 120
 ```
 
-### 4. Run the Application
+## Render deployment
 
-```bash
-python app.py
-```
+1. Push repo to GitHub.
+2. Create a new **Web Service** on Render.
+3. Configure:
+   - Build command: `pip install -r requirements.txt`
+   - Start command: `gunicorn wsgi:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 120`
+4. Add environment variables from `.env.example` in Render dashboard.
+5. Deploy.
+   Alternative: use `render.yaml` blueprint deployment.
 
-Open http://localhost:5000 in your browser.
+After deploy:
+1. In Meta Developers -> Messenger -> Webhooks:
+   - Callback URL: `https://<your-render-domain>/webhook`
+   - Verify token: same value as `FB_VERIFY_TOKEN`
+2. Subscribe page webhook fields (`messages`, `messaging_postbacks`).
+3. Subscribe your Facebook Page to the app.
 
----
+## Scaling notes
 
-## Usage
-
-### Web Interface
-
-1. **Chat** - Ask questions about your documents
-2. **Documents** - Upload files, click "Update KB" after uploading
-
-### Facebook Integration (Optional)
-
-1. Create app at [developers.facebook.com](https://developers.facebook.com)
-2. Add Messenger product
-3. Get Page Access Token
-4. Edit `.env` with your credentials
-5. Configure webhook URL (use ngrok for local testing)
-6. See [FACEBOOK_SETUP.md](FACEBOOK_SETUP.md) for detailed instructions
-
----
-
-## Project Structure
-
-```
-├── app.py          # Flask web routes
-├── rag.py          # RAG engine
-├── fb_bot.py       # Facebook webhook
-├── requirements.txt # Dependencies
-├── .env.example    # Environment template
-├── .gitignore      # Git ignore rules
-└── uploads/        # Uploaded documents
-```
-
----
-
-## Commands
-
-```bash
-# Run the app
-python app.py
-
-# Update knowledge base (after uploading files)
-# Click "Update KB" button in UI or POST to /api/reload
-curl -X POST http://localhost:5000/api/reload
-```
-
----
-
-## Troubleshooting
-
-### No documents loaded
-- Upload files to `uploads/` folder
-- Click "Update KB" button
-
-### Model not found
-```bash
-ollama list
-ollama pull qwen2.5:3b
-ollama pull bge-m3:latest
-```
-
-### Facebook webhook not working
-- Use ngrok: `ngrok http 5000`
-- Configure webhook URL in Facebook Developer Console
-- Verify token must match `FB_VERIFY_TOKEN` in `.env`
-
----
-
-## License
-
-MIT License - see [LICENSE](LICENSE) file.
+- App is stateless and can run multiple instances.
+- Keep long-running LLM calls out of webhook path; use queue workers for heavy AI workloads.
+- Add Redis/job queue if you need retries, delayed jobs, or high throughput.
+- For strict idempotency and audit trails, persist event/message IDs in a shared database.

@@ -91,14 +91,46 @@ class RAGSystem:
         """
         if not message:
             return {"error": "No message provided"}, 400
-        
+
+        # Load user-specific memory from database (only if user_id provided)
+        history = load_user_memory(user_id) if user_id else []
+
+        # Fallback to normal chat if no RAG documents are available.
         if not self.vector_store:
-            return {"response": "No documents available for knowledge base. Please upload documents first."}
-        
+            try:
+                prompt_parts = [
+                    "You are a helpful, natural conversational assistant.",
+                    "Respond like a human assistant in clear, friendly English.",
+                ]
+
+                for msg in history[-10:]:
+                    if msg.get('type') == 'human':
+                        prompt_parts.append(f"User: {msg.get('content', '')}")
+                    elif msg.get('type') == 'ai':
+                        prompt_parts.append(f"Assistant: {msg.get('content', '')}")
+
+                prompt_parts.append(f"User: {message}")
+                prompt_parts.append("Assistant:")
+                prompt = "\n".join(prompt_parts)
+
+                answer = str(self.llm.invoke(prompt)).strip()
+                if not answer:
+                    answer = "I am here. Tell me what you want to talk about."
+
+                if user_id:
+                    updated_history = [
+                        {"type": "human", "content": message},
+                        {"type": "ai", "content": answer}
+                    ]
+                    save_user_memory(user_id, history + updated_history)
+
+                logger.info(f"Chat fallback used for user {user_id or 'web'}: {message[:30]}...")
+                return {"response": answer}
+            except Exception as e:
+                logger.error(f"Fallback chat error: {e}")
+                return {"response": f"Error processing your query: {str(e)}"}, 500
+
         try:
-            # Load user-specific memory from database (only if user_id provided)
-            history = load_user_memory(user_id) if user_id else []
-            
             # Create memory with history
             memory = ConversationBufferMemory(
                 memory_key="chat_history",
