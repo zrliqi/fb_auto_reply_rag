@@ -80,6 +80,7 @@ LLAMA_STREAMING=false
 # Optional local_fun_bot safety net
 LOCAL_API_KEY=use_the_same_secret_in_both_apps
 LOCAL_FUN_BOT_URL=
+USE_LOCAL_FUN_BOT_ON_RULE_BASED=true
 APP_CONFIG_FILE=config.json
 
 PRIVACY_POLICY_NAME=Open Source Community Reply Privacy Policy
@@ -113,6 +114,7 @@ This is the expected runtime behavior for chat responses:
 - `model_used=openai` when OpenAI succeeds.
 - `model_used=llama` when OpenAI fails and LLaMA succeeds.
 - `model_used=local_bot` only if the whole stateful pipeline crashes and final safety fallback is used.
+- If both OpenAI and LLaMA are unavailable, `USE_LOCAL_FUN_BOT_ON_RULE_BASED=true` allows a final continuity attempt via `LOCAL_FUN_BOT_URL`.
 
 ### Verify in database
 

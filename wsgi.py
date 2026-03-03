@@ -61,6 +61,13 @@ def _read_int_env(name: str, default: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(value, maximum))
 
 
+def _read_bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 class ConfigStore:
     """File-backed runtime settings for app-managed values such as NGROK URL."""
 
@@ -106,7 +113,12 @@ class ConfigStore:
             logger.exception("Failed to write config file at %s", self.path)
 
 
-def _forward_to_local_bot(sender_id: str, message_text: str, cfg: dict[str, Any]) -> str:
+def _forward_to_local_bot(
+    sender_id: str,
+    message_text: str,
+    cfg: dict[str, Any],
+    use_default_reply: bool = True,
+) -> str:
     """
     Forward user message to local bot endpoint and return its reply.
     Falls back to default reply when config is missing or call fails.
@@ -129,7 +141,7 @@ def _forward_to_local_bot(sender_id: str, message_text: str, cfg: dict[str, Any]
 
     if not candidate_base_urls:
         logger.warning("No local bot URL configured. Using fallback reply.")
-        return _build_reply(message_text)
+        return _build_reply(message_text) if use_default_reply else ""
 
     headers = {"Content-Type": "application/json"}
     if cfg["local_api_key"]:
@@ -165,7 +177,7 @@ def _forward_to_local_bot(sender_id: str, message_text: str, cfg: dict[str, Any]
             logger.warning("Local bot request failed: endpoint=%s", endpoint)
 
     logger.warning("No reachable local bot endpoint. Using fallback reply.")
-    return _build_reply(message_text)
+    return _build_reply(message_text) if use_default_reply else ""
 
 
 def _send_message(page_access_token: str, api_version: str, recipient_id: str, text: str, timeout_s: int) -> None:
@@ -228,6 +240,20 @@ def _generate_stateful_reply(sender_id: str, text: str, cfg: dict[str, Any]) -> 
             conversation_history=conversation_history,
             user_message=text,
         )
+        if model_used == "rule_based" and _read_bool_env("USE_LOCAL_FUN_BOT_ON_RULE_BASED", True):
+            local_reply = _forward_to_local_bot(
+                sender_id=sender_id,
+                message_text=text,
+                cfg=cfg,
+                use_default_reply=False,
+            )
+            if local_reply:
+                reply = local_reply
+                model_used = "local_bot"
+                logger.warning(
+                    "Primary and fallback model unavailable; switched to local_fun_bot for user_id=%s",
+                    user_id,
+                )
         db.save_message(user_id=user_id, role="assistant", message_text=reply, model_used=model_used)
         logger.info("Generated assistant reply with model_used=%s user_id=%s", model_used, user_id)
         return reply, model_used
@@ -625,6 +651,7 @@ def create_app() -> Flask:
                         "use_fallback": os.getenv("USE_FALLBACK", "true"),
                         "primary_model": os.getenv("PRIMARY_MODEL", "openai"),
                         "fallback_model": os.getenv("FALLBACK_MODEL", "llama"),
+                        "use_local_fun_bot_on_rule_based": os.getenv("USE_LOCAL_FUN_BOT_ON_RULE_BASED", "true"),
                         "openai_key_configured": bool(os.getenv("OPENAI_API_KEY", "").strip()),
                         "ollama": _check_ollama_dependency(),
                     },
