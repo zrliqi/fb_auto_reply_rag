@@ -68,6 +68,13 @@ def _read_bool_env(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _text_preview(value: str, limit: int = 160) -> str:
+    text = (value or "").replace("\n", " ").strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}..."
+
+
 class ConfigStore:
     """File-backed runtime settings for app-managed values such as NGROK URL."""
 
@@ -192,6 +199,13 @@ def _send_message(page_access_token: str, api_version: str, recipient_id: str, t
         resp = requests.post(url, params=params, json=payload, timeout=timeout_s)
         if resp.status_code != 200:
             logger.error("Facebook API send failed: status=%s body=%s", resp.status_code, resp.text)
+            return
+        logger.info(
+            "Facebook outbound message sent recipient_id=%s chars=%s preview=%s",
+            recipient_id,
+            len(text),
+            _text_preview(text),
+        )
     except requests.RequestException:
         logger.exception("Facebook API send request failed.")
 
@@ -274,10 +288,14 @@ def _process_event(event: dict[str, Any], cfg: dict[str, Any]) -> None:
     text = message.get("text")
 
     if not sender_id or not text:
+        if sender_id:
+            logger.info("Ignored non-text Facebook event sender_id=%s keys=%s", sender_id, list(event.keys()))
         return
     if message.get("is_echo"):
+        logger.info("Ignored echo message sender_id=%s", sender_id)
         return
 
+    logger.info("Facebook inbound message sender_id=%s text=%s", sender_id, _text_preview(text))
     reply, _model_used = _generate_stateful_reply(sender_id=sender_id, text=text, cfg=cfg)
 
     _send_message(
@@ -822,12 +840,21 @@ def create_app() -> Flask:
         raw_body = request.get_data()
         signature = request.headers.get("X-Hub-Signature-256", "")
         if not _verify_signature(raw_body, cfg["app_secret"], signature):
+            logger.warning("Rejected webhook due to invalid signature.")
             return "Invalid signature", 403
 
         payload = request.get_json(silent=True) or {}
         if payload.get("object") != "page":
+            logger.info("Ignored webhook payload with object=%s", payload.get("object"))
             return "Ignored", 200
 
+        entry_count = len(payload.get("entry", []))
+        logger.info(
+            "Facebook webhook received entries=%s user_agent=%s remote_addr=%s",
+            entry_count,
+            request.headers.get("User-Agent", ""),
+            request.remote_addr,
+        )
         for entry in payload.get("entry", []):
             for event in entry.get("messaging", []):
                 pool.submit(_process_event, event, cfg)
