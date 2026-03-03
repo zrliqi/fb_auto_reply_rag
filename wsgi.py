@@ -150,7 +150,12 @@ def _forward_to_local_bot(
         logger.warning("No local bot URL configured. Using fallback reply.")
         return _build_reply(message_text) if use_default_reply else ""
 
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        # Helps avoid ngrok browser warning pages for API requests.
+        "ngrok-skip-browser-warning": "true",
+        "User-Agent": "fb-auto-reply-rag/local-bot-forwarder",
+    }
     if cfg["local_api_key"]:
         headers["X-LOCAL-API-KEY"] = cfg["local_api_key"]
 
@@ -224,6 +229,36 @@ def _check_ollama_dependency() -> dict[str, Any]:
         result["reachable"] = resp.status_code == 200
     except requests.RequestException:
         result["reachable"] = False
+    return result
+
+
+def _check_local_fun_bot_dependency(cfg: dict[str, Any]) -> dict[str, Any]:
+    configured_base_url = cfg["config_store"].get_ngrok_base_url().rstrip("/")
+    env_base_url = os.getenv("LOCAL_FUN_BOT_URL", "").strip().rstrip("/")
+    selected_base_url = configured_base_url or env_base_url
+
+    result: dict[str, Any] = {
+        "configured_base_url": configured_base_url,
+        "env_base_url": env_base_url,
+        "selected_base_url": selected_base_url,
+        "reachable": False,
+        "status_code": None,
+        "local_api_key_configured": bool(cfg.get("local_api_key", "")),
+    }
+    if not selected_base_url:
+        return result
+
+    headers = {
+        "ngrok-skip-browser-warning": "true",
+        "User-Agent": "fb-auto-reply-rag/health-check",
+    }
+    try:
+        resp = requests.get(f"{selected_base_url}/health", headers=headers, timeout=3)
+        result["status_code"] = resp.status_code
+        result["reachable"] = resp.status_code == 200
+    except requests.RequestException:
+        result["reachable"] = False
+
     return result
 
 
@@ -672,6 +707,7 @@ def create_app() -> Flask:
                         "use_local_fun_bot_on_rule_based": os.getenv("USE_LOCAL_FUN_BOT_ON_RULE_BASED", "true"),
                         "openai_key_configured": bool(os.getenv("OPENAI_API_KEY", "").strip()),
                         "ollama": _check_ollama_dependency(),
+                        "local_fun_bot": _check_local_fun_bot_dependency(cfg),
                     },
                 }
             ),
