@@ -270,9 +270,11 @@ For app review:
 - `GET /privacy-policy`: privacy policy page
 - `GET /privacy`: privacy alias
 - `GET /health`: health check
+- `GET /health/dependencies`: dependency status (OpenAI/Ollama/local_fun_bot/Facebook config)
 - `GET /webhook`: Meta verify token callback
 - `POST /webhook`: Messenger event receiver
 - `POST /process-message` (in `local_fun_bot.py`): local reply endpoint
+- `GET /health` (in `local_fun_bot.py`): local bot health check
 
 ## Troubleshooting
 
@@ -280,19 +282,47 @@ For app review:
    - `LOCAL_API_KEY` missing in local bot process, or key mismatch.
    - Restart both apps after changing env vars.
 
-2. Homepage tester shows echo (`I received: ...`) instead of fun replies
+2. `ollama serve` fails with `bind: Only one usage of each socket address ...`
+   - Ollama is already running on `127.0.0.1:11434`.
+   - Verify with:
+
+```powershell
+python ollama_server.py status
+```
+
+   - If you want to restart Ollama:
+
+```powershell
+Get-NetTCPConnection -LocalPort 11434 | Select-Object OwningProcess
+Stop-Process -Id <PID> -Force
+ollama serve
+```
+
+3. Homepage tester shows echo (`I received: ...`) instead of fun replies
    - `local_fun_bot.py` is not reachable.
    - Start local bot on `5001` or set `LOCAL_FUN_BOT_URL`.
 
-3. ngrok shows `401` for `/process-message`
+4. ngrok shows `401` for `/process-message`
    - Render `LOCAL_API_KEY` does not match local bot `LOCAL_API_KEY`.
 
-4. Meta webhook verification returns `403`
+5. Meta webhook verification returns `403`
    - `FB_VERIFY_TOKEN` in Render does not match token entered in Meta console.
 
-5. Messages received but no reply in Messenger
+6. Messages received but no reply in Messenger
    - Check `FB_PAGE_ACCESS_TOKEN`.
    - Check app logs for Graph API errors.
+
+7. Render cannot fallback to local_fun_bot via ngrok
+   - Open `https://<your-render-domain>/health/dependencies`.
+   - Verify `models.local_fun_bot.selected_base_url` is set.
+   - Verify `models.local_fun_bot.reachable` is `true`.
+   - If reachable is `false`, make sure:
+     - ngrok tunnel for local bot is running on port `5001`,
+     - `NGROK_BASE_URL` (or `LOCAL_FUN_BOT_URL`) matches current ngrok URL,
+     - `LOCAL_API_KEY` in Render matches local bot `LOCAL_API_KEY`.
+
+8. Facebook webhook receives messages but user gets no reply
+   - If logs show `code 190 Invalid OAuth access token`, replace `FB_PAGE_ACCESS_TOKEN` in Render with a valid Page token.
 
 ## Security Notes
 
