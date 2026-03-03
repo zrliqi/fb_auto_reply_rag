@@ -12,6 +12,10 @@ import requests
 from dotenv import load_dotenv
 from flask import Flask, jsonify, redirect, render_template_string, request, url_for
 
+from ai_engine import generate_ai_reply_with_model
+from database import Database
+from flow_controller import determine_next_stage
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -45,6 +49,16 @@ def _build_reply(message_text: str) -> str:
     if not cleaned:
         return os.getenv("DEFAULT_REPLY", "Thanks for your message.")
     return f"I received: {cleaned}"
+
+
+def _read_int_env(name: str, default: int, minimum: int, maximum: int) -> int:
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid integer for %s='%s'. Using default=%s.", name, raw, default)
+        return default
+    return max(minimum, min(value, maximum))
 
 
 class ConfigStore:
@@ -162,9 +176,70 @@ def _send_message(page_access_token: str, api_version: str, recipient_id: str, t
         "message": {"text": text},
         "messaging_type": "RESPONSE",
     }
-    resp = requests.post(url, params=params, json=payload, timeout=timeout_s)
-    if resp.status_code != 200:
-        logger.error("Facebook API send failed: status=%s body=%s", resp.status_code, resp.text)
+    try:
+        resp = requests.post(url, params=params, json=payload, timeout=timeout_s)
+        if resp.status_code != 200:
+            logger.error("Facebook API send failed: status=%s body=%s", resp.status_code, resp.text)
+    except requests.RequestException:
+        logger.exception("Facebook API send request failed.")
+
+
+def _check_ollama_dependency() -> dict[str, Any]:
+    base_url = os.getenv("OLLAMA_API_BASE", "http://127.0.0.1:11434").rstrip("/")
+    result: dict[str, Any] = {
+        "api_base": base_url,
+        "reachable": False,
+        "status_code": None,
+        "model_configured": os.getenv("OLLAMA_MODEL", "qwen2.5:3b").strip(),
+    }
+    try:
+        resp = requests.get(f"{base_url}/api/tags", timeout=3)
+        result["status_code"] = resp.status_code
+        result["reachable"] = resp.status_code == 200
+    except requests.RequestException:
+        result["reachable"] = False
+    return result
+
+
+def _generate_stateful_reply(sender_id: str, text: str, cfg: dict[str, Any]) -> tuple[str, str]:
+    """
+    Generate and persist a stateful reply using OpenAI->LLaMA routing.
+    Falls back to local_fun_bot only when this stateful pipeline crashes.
+    """
+    db: Database = cfg["database"]
+    user_id: int | None = None
+
+    try:
+        user = db.get_or_create_user(facebook_id=sender_id, initial_stage="greeting")
+        user_id = int(user["id"])
+
+        db.save_message(user_id=user_id, role="user", message_text=text)
+        conversation_history = db.get_recent_messages(user_id=user_id, limit=cfg["context_message_limit"])
+
+        current_stage = str(user.get("current_stage", "greeting"))
+        next_stage = determine_next_stage(current_stage=current_stage, user_message=text)
+        if next_stage != current_stage:
+            db.set_user_stage(user_id=user_id, new_stage=next_stage)
+        else:
+            db.touch_user(user_id=user_id)
+
+        reply, model_used = generate_ai_reply_with_model(
+            stage=next_stage,
+            conversation_history=conversation_history,
+            user_message=text,
+        )
+        db.save_message(user_id=user_id, role="assistant", message_text=reply, model_used=model_used)
+        logger.info("Generated assistant reply with model_used=%s user_id=%s", model_used, user_id)
+        return reply, model_used
+    except Exception:
+        logger.exception("Stateful AI processing failed; falling back to local bot.")
+        reply = _forward_to_local_bot(sender_id, text, cfg)
+        if user_id is not None:
+            try:
+                db.save_message(user_id=user_id, role="assistant", message_text=reply, model_used="local_bot")
+            except Exception:
+                logger.exception("Failed to persist fallback local_bot response for user_id=%s", user_id)
+        return reply, "local_bot"
 
 
 def _process_event(event: dict[str, Any], cfg: dict[str, Any]) -> None:
@@ -177,7 +252,8 @@ def _process_event(event: dict[str, Any], cfg: dict[str, Any]) -> None:
     if message.get("is_echo"):
         return
 
-    reply = _forward_to_local_bot(sender_id, text, cfg)
+    reply, _model_used = _generate_stateful_reply(sender_id=sender_id, text=text, cfg=cfg)
+
     _send_message(
         page_access_token=cfg["page_access_token"],
         api_version=cfg["graph_api_version"],
@@ -192,14 +268,19 @@ def create_app() -> Flask:
 
     flask_app = Flask(__name__)
     config_store = ConfigStore(os.getenv("APP_CONFIG_FILE", "config.json"))
+    database = Database(os.getenv("SQLITE_DB_PATH", "data/conversations.db"))
+    database.init_db()
+
     cfg = {
         "verify_token": os.getenv("FB_VERIFY_TOKEN", ""),
         "page_access_token": os.getenv("FB_PAGE_ACCESS_TOKEN", ""),
         "app_secret": os.getenv("FB_APP_SECRET", ""),
         "graph_api_version": os.getenv("FB_GRAPH_API_VERSION", "v20.0"),
         "timeout_seconds": int(os.getenv("WEBHOOK_TIMEOUT_SECONDS", "10")),
+        "context_message_limit": _read_int_env("CONTEXT_HISTORY_LIMIT", 12, 1, 50),
         "local_api_key": os.getenv("LOCAL_API_KEY", ""),
         "config_store": config_store,
+        "database": database,
     }
     pool = ThreadPoolExecutor(max_workers=8)
 
@@ -528,6 +609,30 @@ def create_app() -> Flask:
     def health():
         return jsonify({"status": "ok"}), 200
 
+    @flask_app.get("/health/dependencies")
+    def dependency_health():
+        return (
+            jsonify(
+                {
+                    "status": "ok",
+                    "database_path": str(cfg["database"].db_path),
+                    "facebook": {
+                        "verify_token_configured": bool(cfg["verify_token"]),
+                        "page_access_token_configured": bool(cfg["page_access_token"]),
+                        "app_secret_configured": bool(cfg["app_secret"]),
+                    },
+                    "models": {
+                        "use_fallback": os.getenv("USE_FALLBACK", "true"),
+                        "primary_model": os.getenv("PRIMARY_MODEL", "openai"),
+                        "fallback_model": os.getenv("FALLBACK_MODEL", "llama"),
+                        "openai_key_configured": bool(os.getenv("OPENAI_API_KEY", "").strip()),
+                        "ollama": _check_ollama_dependency(),
+                    },
+                }
+            ),
+            200,
+        )
+
     @flask_app.post("/chat/reply")
     def chat_reply():
         payload = request.get_json(silent=True) or {}
@@ -538,8 +643,8 @@ def create_app() -> Flask:
             return jsonify({"error": "message is required"}), 400
 
         try:
-            reply = _forward_to_local_bot(sender_id=sender_id, message_text=message, cfg=cfg)
-            return jsonify({"reply": reply}), 200
+            reply, model_used = _generate_stateful_reply(sender_id=sender_id, text=message, cfg=cfg)
+            return jsonify({"reply": reply, "model_used": model_used}), 200
         except Exception:
             logger.exception("Homepage chat reply failed.")
             return jsonify({"error": "Internal server error"}), 500
