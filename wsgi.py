@@ -97,38 +97,61 @@ def _forward_to_local_bot(sender_id: str, message_text: str, cfg: dict[str, Any]
     Forward user message to local bot endpoint and return its reply.
     Falls back to default reply when config is missing or call fails.
     """
-    base_url = cfg["config_store"].get_ngrok_base_url()
-    if not base_url:
-        logger.warning("NGROK_BASE_URL is not configured. Using fallback reply.")
+    configured_base_url = cfg["config_store"].get_ngrok_base_url().rstrip("/")
+    candidate_base_urls: list[str] = []
+
+    if configured_base_url:
+        candidate_base_urls.append(configured_base_url)
+
+    env_base_url = os.getenv("LOCAL_FUN_BOT_URL", "").strip().rstrip("/")
+    if env_base_url and env_base_url not in candidate_base_urls:
+        candidate_base_urls.append(env_base_url)
+
+    # Local development convenience: talk directly to local_fun_bot if running.
+    if os.getenv("FLASK_ENV", "").strip().lower() == "development":
+        for local_base in ("http://127.0.0.1:5001", "http://localhost:5001"):
+            if local_base not in candidate_base_urls:
+                candidate_base_urls.append(local_base)
+
+    if not candidate_base_urls:
+        logger.warning("No local bot URL configured. Using fallback reply.")
         return _build_reply(message_text)
 
-    endpoint = f"{base_url.rstrip('/')}/process-message"
     headers = {"Content-Type": "application/json"}
     if cfg["local_api_key"]:
         headers["X-LOCAL-API-KEY"] = cfg["local_api_key"]
 
-    try:
-        resp = requests.post(
-            endpoint,
-            json={"sender_id": sender_id, "message": message_text},
-            headers=headers,
-            timeout=cfg["timeout_seconds"],
-        )
-        if resp.status_code != 200:
-            logger.error(
-                "Local bot call failed: status=%s endpoint=%s body=%s",
-                resp.status_code,
-                endpoint,
-                resp.text,
-            )
-            return _build_reply(message_text)
+    for base_url in candidate_base_urls:
+        endpoint = f"{base_url}/process-message"
+        timeout_seconds = cfg["timeout_seconds"]
+        if base_url != configured_base_url:
+            timeout_seconds = min(timeout_seconds, 2)
 
-        payload = resp.json()
-        reply = str(payload.get("reply", "")).strip()
-        return reply or _build_reply(message_text)
-    except (requests.RequestException, ValueError):
-        logger.exception("Local bot request failed: endpoint=%s", endpoint)
-        return _build_reply(message_text)
+        try:
+            resp = requests.post(
+                endpoint,
+                json={"sender_id": sender_id, "message": message_text},
+                headers=headers,
+                timeout=timeout_seconds,
+            )
+            if resp.status_code != 200:
+                logger.warning(
+                    "Local bot call failed: status=%s endpoint=%s body=%s",
+                    resp.status_code,
+                    endpoint,
+                    resp.text,
+                )
+                continue
+
+            payload = resp.json()
+            reply = str(payload.get("reply", "")).strip()
+            if reply:
+                return reply
+        except (requests.RequestException, ValueError):
+            logger.warning("Local bot request failed: endpoint=%s", endpoint)
+
+    logger.warning("No reachable local bot endpoint. Using fallback reply.")
+    return _build_reply(message_text)
 
 
 def _send_message(page_access_token: str, api_version: str, recipient_id: str, text: str, timeout_s: int) -> None:
@@ -196,26 +219,306 @@ def create_app() -> Flask:
         <head>
             <meta charset="UTF-8" />
             <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-            <title>Bot Menu</title>
+            <title>Open Source Community Reply</title>
             <style>
-                body { font-family: Arial, sans-serif; max-width: 760px; margin: 40px auto; padding: 0 16px; color: #111; }
-                .card { border: 1px solid #ddd; border-radius: 8px; padding: 20px; }
-                .muted { color: #555; }
-                .menu { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
-                .menu a { text-decoration: none; border: 1px solid #ddd; border-radius: 8px; padding: 10px 14px; color: #111; }
-                .menu a:hover { background: #f7f7f7; }
+                @import url('https://fonts.googleapis.com/css2?family=Fraunces:wght@500;700&family=Manrope:wght@400;600;700&display=swap');
+                :root {
+                    --bg-top: #fdf4e7;
+                    --bg-bottom: #e8f4f5;
+                    --ink: #10232c;
+                    --muted: #365161;
+                    --card: rgba(255, 255, 255, 0.82);
+                    --line: rgba(16, 35, 44, 0.14);
+                    --accent: #e97f2f;
+                    --accent-dark: #c6651c;
+                    --teal: #0f8e8a;
+                }
+                * { box-sizing: border-box; }
+                body {
+                    margin: 0;
+                    min-height: 100vh;
+                    font-family: "Manrope", "Segoe UI", sans-serif;
+                    color: var(--ink);
+                    background:
+                        radial-gradient(circle at 8% 8%, rgba(233, 127, 47, 0.20) 0, rgba(233, 127, 47, 0) 34%),
+                        radial-gradient(circle at 92% 14%, rgba(15, 142, 138, 0.18) 0, rgba(15, 142, 138, 0) 36%),
+                        linear-gradient(145deg, var(--bg-top) 0%, var(--bg-bottom) 100%);
+                    padding: 28px 18px;
+                    display: grid;
+                    place-items: center;
+                }
+                .shell {
+                    width: min(980px, 100%);
+                    background: var(--card);
+                    border: 1px solid var(--line);
+                    border-radius: 24px;
+                    backdrop-filter: blur(6px);
+                    box-shadow: 0 14px 40px rgba(16, 35, 44, 0.12);
+                    padding: 34px 30px;
+                    animation: rise 650ms ease-out;
+                }
+                .eyebrow {
+                    display: inline-block;
+                    border: 1px solid rgba(15, 142, 138, 0.3);
+                    color: var(--teal);
+                    font-size: 12px;
+                    letter-spacing: 0.08em;
+                    text-transform: uppercase;
+                    font-weight: 700;
+                    border-radius: 999px;
+                    padding: 6px 10px;
+                    background: rgba(15, 142, 138, 0.09);
+                }
+                h1 {
+                    font-family: "Fraunces", Georgia, serif;
+                    font-size: clamp(28px, 5vw, 52px);
+                    line-height: 1.06;
+                    margin: 14px 0 8px;
+                    letter-spacing: -0.02em;
+                }
+                .subtitle {
+                    max-width: 62ch;
+                    color: var(--muted);
+                    font-size: 16px;
+                    margin: 0 0 22px;
+                }
+                .status {
+                    display: inline-flex;
+                    align-items: center;
+                    gap: 8px;
+                    font-weight: 700;
+                    font-size: 14px;
+                    border-radius: 999px;
+                    padding: 7px 12px;
+                    color: #0f6c3a;
+                    background: rgba(69, 179, 107, 0.12);
+                    border: 1px solid rgba(69, 179, 107, 0.34);
+                }
+                .status::before {
+                    content: "";
+                    width: 8px;
+                    height: 8px;
+                    border-radius: 999px;
+                    background: #22a850;
+                    box-shadow: 0 0 0 6px rgba(34, 168, 80, 0.18);
+                }
+                .menu {
+                    margin-top: 24px;
+                    display: grid;
+                    grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+                    gap: 14px;
+                }
+                .menu a {
+                    position: relative;
+                    overflow: hidden;
+                    text-decoration: none;
+                    color: var(--ink);
+                    border: 1px solid var(--line);
+                    border-radius: 16px;
+                    background: rgba(255, 255, 255, 0.86);
+                    padding: 18px 16px;
+                    font-weight: 700;
+                    transition: transform 180ms ease, border-color 180ms ease, box-shadow 180ms ease;
+                    animation: rise 620ms ease-out both;
+                }
+                .menu a:nth-child(1) { animation-delay: 120ms; }
+                .menu a:nth-child(2) { animation-delay: 200ms; }
+                .menu a:nth-child(3) { animation-delay: 280ms; }
+                .menu a::after {
+                    content: "";
+                    position: absolute;
+                    right: -28px;
+                    bottom: -36px;
+                    width: 90px;
+                    height: 90px;
+                    border-radius: 50%;
+                    background: radial-gradient(circle, rgba(233, 127, 47, 0.30) 0%, rgba(233, 127, 47, 0) 72%);
+                }
+                .menu a:hover {
+                    transform: translateY(-2px);
+                    border-color: rgba(233, 127, 47, 0.42);
+                    box-shadow: 0 10px 24px rgba(16, 35, 44, 0.13);
+                }
+                .menu a span {
+                    display: block;
+                    font-size: 12px;
+                    margin-top: 8px;
+                    font-weight: 600;
+                    color: var(--muted);
+                }
+                .footer {
+                    margin-top: 22px;
+                    color: var(--muted);
+                    font-size: 13px;
+                }
+                .chat {
+                    margin-top: 22px;
+                    border: 1px solid var(--line);
+                    border-radius: 16px;
+                    background: rgba(255, 255, 255, 0.8);
+                    padding: 16px;
+                }
+                .chat h2 {
+                    font-family: "Fraunces", Georgia, serif;
+                    font-size: clamp(20px, 3.5vw, 30px);
+                    margin: 0 0 6px;
+                }
+                .chat-tip {
+                    margin: 0 0 12px;
+                    color: var(--muted);
+                    font-size: 14px;
+                }
+                .chat-log {
+                    border: 1px solid var(--line);
+                    border-radius: 12px;
+                    background: rgba(253, 253, 253, 0.95);
+                    height: 260px;
+                    overflow-y: auto;
+                    padding: 12px;
+                    display: flex;
+                    flex-direction: column;
+                    gap: 10px;
+                }
+                .bubble {
+                    max-width: 78%;
+                    padding: 10px 12px;
+                    border-radius: 12px;
+                    font-size: 14px;
+                    line-height: 1.4;
+                    word-break: break-word;
+                }
+                .bubble.user {
+                    align-self: flex-end;
+                    border: 1px solid rgba(233, 127, 47, 0.35);
+                    background: rgba(233, 127, 47, 0.12);
+                }
+                .bubble.bot {
+                    align-self: flex-start;
+                    border: 1px solid rgba(16, 35, 44, 0.14);
+                    background: rgba(15, 142, 138, 0.08);
+                }
+                .chat-form {
+                    margin-top: 12px;
+                    display: grid;
+                    grid-template-columns: 1fr auto;
+                    gap: 10px;
+                }
+                .chat-form input {
+                    border: 1px solid var(--line);
+                    border-radius: 10px;
+                    padding: 11px 12px;
+                    font-size: 14px;
+                    font-family: inherit;
+                    outline: none;
+                }
+                .chat-form input:focus {
+                    border-color: rgba(15, 142, 138, 0.6);
+                    box-shadow: 0 0 0 3px rgba(15, 142, 138, 0.16);
+                }
+                .chat-form button {
+                    border: 1px solid transparent;
+                    border-radius: 10px;
+                    padding: 11px 16px;
+                    font-weight: 700;
+                    font-size: 14px;
+                    font-family: inherit;
+                    color: #fff;
+                    background: linear-gradient(135deg, var(--accent), var(--accent-dark));
+                    cursor: pointer;
+                }
+                .chat-form button:disabled {
+                    opacity: 0.65;
+                    cursor: not-allowed;
+                }
+                @keyframes rise {
+                    from { opacity: 0; transform: translateY(12px); }
+                    to { opacity: 1; transform: translateY(0); }
+                }
+                @media (max-width: 640px) {
+                    body { padding: 16px; }
+                    .shell { padding: 22px 18px; border-radius: 18px; }
+                    .chat-log { height: 220px; }
+                    .bubble { max-width: 90%; }
+                    .chat-form { grid-template-columns: 1fr; }
+                }
             </style>
         </head>
         <body>
-            <div class="card">
-                <h1>Facebook Messenger Bot</h1>
-                <p class="muted">Service status: running</p>
+            <div class="shell">
+                <span class="eyebrow">Messenger Automation</span>
+                <h1>Open Source Community Reply</h1>
+                <p class="subtitle">Manage your bot settings, publish your privacy policy, and verify service health from one clean control surface.</p>
+                <p class="status">Service status: running</p>
                 <div class="menu">
-                    <a href="{{ url_for('settings_page') }}">Settings</a>
-                    <a href="{{ url_for('privacy_policy') }}">Privacy Policy</a>
-                    <a href="{{ url_for('health') }}">Health</a>
+                    <a href="{{ url_for('settings_page') }}">Settings<span>Update NGROK base URL and forwarding target.</span></a>
+                    <a href="{{ url_for('privacy_policy') }}">Privacy Policy<span>Public page for Messenger app review submission.</span></a>
+                    <a href="{{ url_for('health') }}">Health<span>Quick status endpoint for uptime checks.</span></a>
                 </div>
+                <section class="chat" id="live-reply">
+                    <h2>Live Reply Tester</h2>
+                    <p class="chat-tip">Send a test message from this page and see the bot response instantly.</p>
+                    <div class="chat-log" id="chat-log" aria-live="polite">
+                        <div class="bubble bot">Ready. Ask me anything to verify your reply pipeline.</div>
+                    </div>
+                    <form class="chat-form" id="chat-form">
+                        <input id="chat-input" type="text" maxlength="500" placeholder="Type a message..." required />
+                        <button id="chat-send" type="submit">Send</button>
+                    </form>
+                </section>
+                <p class="footer">Built for local + Render workflow.</p>
             </div>
+            <script>
+                (function () {
+                    const form = document.getElementById("chat-form");
+                    const input = document.getElementById("chat-input");
+                    const log = document.getElementById("chat-log");
+                    const sendButton = document.getElementById("chat-send");
+                    const endpoint = "{{ url_for('chat_reply') }}";
+
+                    function appendBubble(role, text) {
+                        const bubble = document.createElement("div");
+                        bubble.className = "bubble " + role;
+                        bubble.textContent = text;
+                        log.appendChild(bubble);
+                        log.scrollTop = log.scrollHeight;
+                    }
+
+                    form.addEventListener("submit", async function (event) {
+                        event.preventDefault();
+                        const message = input.value.trim();
+                        if (!message) {
+                            return;
+                        }
+
+                        appendBubble("user", message);
+                        input.value = "";
+                        sendButton.disabled = true;
+                        sendButton.textContent = "Sending...";
+
+                        try {
+                            const response = await fetch(endpoint, {
+                                method: "POST",
+                                headers: { "Content-Type": "application/json" },
+                                body: JSON.stringify({
+                                    sender_id: "homepage-user",
+                                    message: message
+                                })
+                            });
+                            const data = await response.json().catch(function () { return {}; });
+                            if (!response.ok) {
+                                throw new Error(data.error || "Failed to get reply.");
+                            }
+                            appendBubble("bot", data.reply || "No reply from bot.");
+                        } catch (error) {
+                            appendBubble("bot", "Error: " + (error.message || "Unknown error"));
+                        } finally {
+                            sendButton.disabled = false;
+                            sendButton.textContent = "Send";
+                            input.focus();
+                        }
+                    });
+                })();
+            </script>
         </body>
         </html>
         """
@@ -225,11 +528,27 @@ def create_app() -> Flask:
     def health():
         return jsonify({"status": "ok"}), 200
 
+    @flask_app.post("/chat/reply")
+    def chat_reply():
+        payload = request.get_json(silent=True) or {}
+        message = str(payload.get("message", "")).strip()
+        sender_id = str(payload.get("sender_id", "homepage-user")).strip() or "homepage-user"
+
+        if not message:
+            return jsonify({"error": "message is required"}), 400
+
+        try:
+            reply = _forward_to_local_bot(sender_id=sender_id, message_text=message, cfg=cfg)
+            return jsonify({"reply": reply}), 200
+        except Exception:
+            logger.exception("Homepage chat reply failed.")
+            return jsonify({"error": "Internal server error"}), 500
+
     @flask_app.get("/privacy-policy")
     @flask_app.get("/privacy")
     def privacy_policy():
-        policy_name = os.getenv("PRIVACY_POLICY_NAME", "FB Auto Reply Bot Privacy Policy")
-        contact_email = os.getenv("PRIVACY_CONTACT_EMAIL", "support@example.com")
+        policy_name = os.getenv("PRIVACY_POLICY_NAME", "Open Source Community Reply Privacy Policy")
+        contact_email = os.getenv("PRIVACY_CONTACT_EMAIL", "zrliqi9224@gmail.com")
         html = """
         <!DOCTYPE html>
         <html lang="en">
@@ -293,7 +612,7 @@ def create_app() -> Flask:
         <head>
             <meta charset="UTF-8" />
             <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-            <title>Bot Settings</title>
+            <title>Open Source Community Reply Settings</title>
             <style>
                 body { font-family: Arial, sans-serif; max-width: 760px; margin: 40px auto; padding: 0 16px; }
                 .card { border: 1px solid #ddd; border-radius: 8px; padding: 20px; }
