@@ -1,13 +1,16 @@
 import hashlib
 import hmac
+import json
 import logging
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any
 
 import requests
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, redirect, render_template_string, request, url_for
 
 load_dotenv()
 
@@ -44,6 +47,90 @@ def _build_reply(message_text: str) -> str:
     return f"I received: {cleaned}"
 
 
+class ConfigStore:
+    """File-backed runtime settings for app-managed values such as NGROK URL."""
+
+    def __init__(self, path: str) -> None:
+        self.path = Path(path)
+        self._lock = threading.Lock()
+
+    def get_ngrok_base_url(self) -> str:
+        # Environment variable remains a fallback if no saved config exists.
+        data = self._read()
+        return data.get("ngrok_base_url", "").strip() or os.getenv("NGROK_BASE_URL", "").strip()
+
+    def set_ngrok_base_url(self, url: str) -> None:
+        with self._lock:
+            data = self._read_unlocked()
+            data["ngrok_base_url"] = url.strip()
+            self._write_unlocked(data)
+
+    def _read(self) -> dict[str, str]:
+        with self._lock:
+            return self._read_unlocked()
+
+    def _read_unlocked(self) -> dict[str, str]:
+        if not self.path.exists():
+            return {}
+        try:
+            with self.path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except (OSError, json.JSONDecodeError):
+            logger.exception("Failed to read config file at %s", self.path)
+        return {}
+
+    def _write_unlocked(self, data: dict[str, str]) -> None:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp")
+            with tmp.open("w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            tmp.replace(self.path)
+        except OSError:
+            logger.exception("Failed to write config file at %s", self.path)
+
+
+def _forward_to_local_bot(sender_id: str, message_text: str, cfg: dict[str, Any]) -> str:
+    """
+    Forward user message to local bot endpoint and return its reply.
+    Falls back to default reply when config is missing or call fails.
+    """
+    base_url = cfg["config_store"].get_ngrok_base_url()
+    if not base_url:
+        logger.warning("NGROK_BASE_URL is not configured. Using fallback reply.")
+        return _build_reply(message_text)
+
+    endpoint = f"{base_url.rstrip('/')}/process-message"
+    headers = {"Content-Type": "application/json"}
+    if cfg["local_api_key"]:
+        headers["X-LOCAL-API-KEY"] = cfg["local_api_key"]
+
+    try:
+        resp = requests.post(
+            endpoint,
+            json={"sender_id": sender_id, "message": message_text},
+            headers=headers,
+            timeout=cfg["timeout_seconds"],
+        )
+        if resp.status_code != 200:
+            logger.error(
+                "Local bot call failed: status=%s endpoint=%s body=%s",
+                resp.status_code,
+                endpoint,
+                resp.text,
+            )
+            return _build_reply(message_text)
+
+        payload = resp.json()
+        reply = str(payload.get("reply", "")).strip()
+        return reply or _build_reply(message_text)
+    except (requests.RequestException, ValueError):
+        logger.exception("Local bot request failed: endpoint=%s", endpoint)
+        return _build_reply(message_text)
+
+
 def _send_message(page_access_token: str, api_version: str, recipient_id: str, text: str, timeout_s: int) -> None:
     url = f"https://graph.facebook.com/{api_version}/me/messages"
     params = {"access_token": page_access_token}
@@ -67,7 +154,7 @@ def _process_event(event: dict[str, Any], cfg: dict[str, Any]) -> None:
     if message.get("is_echo"):
         return
 
-    reply = _build_reply(text)
+    reply = _forward_to_local_bot(sender_id, text, cfg)
     _send_message(
         page_access_token=cfg["page_access_token"],
         api_version=cfg["graph_api_version"],
@@ -81,12 +168,15 @@ def create_app() -> Flask:
     _setup_logging()
 
     flask_app = Flask(__name__)
+    config_store = ConfigStore(os.getenv("APP_CONFIG_FILE", "config.json"))
     cfg = {
         "verify_token": os.getenv("FB_VERIFY_TOKEN", ""),
         "page_access_token": os.getenv("FB_PAGE_ACCESS_TOKEN", ""),
         "app_secret": os.getenv("FB_APP_SECRET", ""),
         "graph_api_version": os.getenv("FB_GRAPH_API_VERSION", "v20.0"),
         "timeout_seconds": int(os.getenv("WEBHOOK_TIMEOUT_SECONDS", "10")),
+        "local_api_key": os.getenv("LOCAL_API_KEY", ""),
+        "config_store": config_store,
     }
     pool = ThreadPoolExecutor(max_workers=8)
 
@@ -105,6 +195,70 @@ def create_app() -> Flask:
     @flask_app.get("/health")
     def health():
         return jsonify({"status": "ok"}), 200
+
+    @flask_app.get("/settings")
+    def settings_page():
+        # Small in-app admin page for runtime ngrok forwarding configuration.
+        current_url = cfg["config_store"].get_ngrok_base_url()
+        status = request.args.get("status", "")
+        error = request.args.get("error", "")
+        html = """
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+            <title>Bot Settings</title>
+            <style>
+                body { font-family: Arial, sans-serif; max-width: 760px; margin: 40px auto; padding: 0 16px; }
+                .card { border: 1px solid #ddd; border-radius: 8px; padding: 20px; }
+                input { width: 100%; padding: 10px; margin: 8px 0 14px; box-sizing: border-box; }
+                button { padding: 10px 16px; }
+                .ok { color: #0a7a31; }
+                .err { color: #b42318; }
+                .hint { color: #555; font-size: 14px; }
+            </style>
+        </head>
+        <body>
+            <div class="card">
+                <h2>Local Bot URL Settings</h2>
+                {% if status %}<p class="ok">{{ status }}</p>{% endif %}
+                {% if error %}<p class="err">{{ error }}</p>{% endif %}
+                <p><strong>Current NGROK_BASE_URL:</strong> {{ current_url or "Not set" }}</p>
+                <form method="post" action="{{ url_for('save_settings') }}">
+                    <label for="ngrok_url">NGROK_BASE_URL</label>
+                    <input
+                        id="ngrok_url"
+                        name="ngrok_url"
+                        type="url"
+                        placeholder="https://abcd-1234.ngrok-free.app"
+                        value="{{ current_url }}"
+                        required
+                    />
+                    <button type="submit">Save</button>
+                </form>
+                <p class="hint">Forward target: {NGROK_BASE_URL}/process-message</p>
+            </div>
+        </body>
+        </html>
+        """
+        return render_template_string(html, current_url=current_url, status=status, error=error), 200
+
+    @flask_app.post("/settings")
+    def save_settings():
+        # Accept and validate admin-submitted ngrok URL before persisting.
+        raw_url = (request.form.get("ngrok_url", "") or "").strip()
+        if not raw_url.startswith(("http://", "https://")):
+            return redirect(url_for("settings_page", error="URL must start with http:// or https://"))
+
+        normalized = raw_url.rstrip("/")
+        try:
+            cfg["config_store"].set_ngrok_base_url(normalized)
+            logger.info("NGROK_BASE_URL updated to %s", normalized)
+            return redirect(url_for("settings_page", status="NGROK_BASE_URL saved"))
+        except Exception:
+            logger.exception("Failed to update NGROK_BASE_URL")
+            return redirect(url_for("settings_page", error="Failed to save URL"))
 
     @flask_app.get("/webhook")
     def verify_webhook():
@@ -139,4 +293,3 @@ def create_app() -> Flask:
 
 
 app = create_app()
-
