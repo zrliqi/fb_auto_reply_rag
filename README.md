@@ -115,6 +115,7 @@ This is the expected runtime behavior for chat responses:
 - `model_used=llama` when OpenAI fails and LLaMA succeeds.
 - `model_used=local_bot` only if the whole stateful pipeline crashes and final safety fallback is used.
 - If both OpenAI and LLaMA are unavailable, `USE_LOCAL_FUN_BOT_ON_RULE_BASED=true` allows a final continuity attempt via `LOCAL_FUN_BOT_URL`.
+- `local_fun_bot.py` can also generate LLaMA responses itself and persist them to SQLite when Render forwards fallback traffic.
 
 ### Verify in database
 
@@ -149,6 +150,9 @@ Copy-Item .env.example .env
 
 ```powershell
 $env:LOCAL_API_KEY="your_shared_local_api_key"
+$env:LOCAL_BOT_FORCE_LLAMA="true"
+$env:LOCAL_BOT_PRIMARY_MODEL="llama"
+$env:LOCAL_BOT_USE_FALLBACK="false"
 $env:FLASK_APP="local_fun_bot.py"
 & "C:\Program Files\Python314\python.exe" -m flask run --host 0.0.0.0 --port 5001
 ```
