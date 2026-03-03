@@ -176,9 +176,29 @@ def _send_message(page_access_token: str, api_version: str, recipient_id: str, t
         "message": {"text": text},
         "messaging_type": "RESPONSE",
     }
-    resp = requests.post(url, params=params, json=payload, timeout=timeout_s)
-    if resp.status_code != 200:
-        logger.error("Facebook API send failed: status=%s body=%s", resp.status_code, resp.text)
+    try:
+        resp = requests.post(url, params=params, json=payload, timeout=timeout_s)
+        if resp.status_code != 200:
+            logger.error("Facebook API send failed: status=%s body=%s", resp.status_code, resp.text)
+    except requests.RequestException:
+        logger.exception("Facebook API send request failed.")
+
+
+def _check_ollama_dependency() -> dict[str, Any]:
+    base_url = os.getenv("OLLAMA_API_BASE", "http://127.0.0.1:11434").rstrip("/")
+    result: dict[str, Any] = {
+        "api_base": base_url,
+        "reachable": False,
+        "status_code": None,
+        "model_configured": os.getenv("OLLAMA_MODEL", "qwen2.5:3b").strip(),
+    }
+    try:
+        resp = requests.get(f"{base_url}/api/tags", timeout=3)
+        result["status_code"] = resp.status_code
+        result["reachable"] = resp.status_code == 200
+    except requests.RequestException:
+        result["reachable"] = False
+    return result
 
 
 def _generate_stateful_reply(sender_id: str, text: str, cfg: dict[str, Any]) -> tuple[str, str]:
@@ -588,6 +608,30 @@ def create_app() -> Flask:
     @flask_app.get("/health")
     def health():
         return jsonify({"status": "ok"}), 200
+
+    @flask_app.get("/health/dependencies")
+    def dependency_health():
+        return (
+            jsonify(
+                {
+                    "status": "ok",
+                    "database_path": str(cfg["database"].db_path),
+                    "facebook": {
+                        "verify_token_configured": bool(cfg["verify_token"]),
+                        "page_access_token_configured": bool(cfg["page_access_token"]),
+                        "app_secret_configured": bool(cfg["app_secret"]),
+                    },
+                    "models": {
+                        "use_fallback": os.getenv("USE_FALLBACK", "true"),
+                        "primary_model": os.getenv("PRIMARY_MODEL", "openai"),
+                        "fallback_model": os.getenv("FALLBACK_MODEL", "llama"),
+                        "openai_key_configured": bool(os.getenv("OPENAI_API_KEY", "").strip()),
+                        "ollama": _check_ollama_dependency(),
+                    },
+                }
+            ),
+            200,
+        )
 
     @flask_app.post("/chat/reply")
     def chat_reply():
