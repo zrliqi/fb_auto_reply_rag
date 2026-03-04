@@ -1,6 +1,6 @@
 # Open Source Community Reply
 
-Flask-based Facebook Messenger webhook app that can forward replies to a local bot (`local_fun_bot.py`) and includes:
+Flask-based Facebook Messenger webhook app with OpenAI-first replies, local LLaMA fallback, and an optional Render-to-local bridge via `local_fun_bot.py`.
 
 - A homepage control panel (`/`) with a live reply tester
 - Runtime settings page (`/settings`) to store ngrok URL
@@ -19,9 +19,9 @@ Flow:
 1. Messenger event hits `wsgi.py` on `/webhook`
 2. `wsgi.py` loads recent conversation context from SQLite
 3. `wsgi.py` calls `ai_engine.py` with OpenAI as primary model
-4. If OpenAI fails (quota/rate limit/timeout/5xx), `ai_engine.py` falls back to local LLaMA (Ollama)
-5. Reply is saved with `model_used` and sent through Facebook Graph API
-6. If stateful processing fails entirely, `wsgi.py` can still forward to `local_fun_bot.py` as a final safety net
+4. If OpenAI fails (quota/rate limit/timeout/5xx), `ai_engine.py` falls back to LLaMA/Ollama
+5. If both primary and fallback models are unavailable, `wsgi.py` can bridge to `local_fun_bot.py` (for example via ngrok)
+6. Reply is saved with `model_used` and sent through Facebook Graph API
 
 The homepage tester (`POST /chat/reply`) uses the same forwarding logic.
 
@@ -81,7 +81,13 @@ LLAMA_STREAMING=false
 LOCAL_API_KEY=use_the_same_secret_in_both_apps
 LOCAL_FUN_BOT_URL=
 USE_LOCAL_FUN_BOT_ON_RULE_BASED=true
-APP_CONFIG_FILE=config.json
+
+# local_fun_bot model routing and storage
+LOCAL_BOT_FORCE_LLAMA=true
+LOCAL_BOT_PRIMARY_MODEL=llama
+LOCAL_BOT_FALLBACK_MODEL=llama
+LOCAL_BOT_USE_FALLBACK=false
+LOCAL_BOT_SQLITE_DB_PATH=data/conversations.db
 
 PRIVACY_POLICY_NAME=Open Source Community Reply Privacy Policy
 PRIVACY_CONTACT_EMAIL=zrliqi9224@gmail.com
@@ -99,6 +105,18 @@ Notes:
   - `http://localhost:5001`
 - `NGROK_BASE_URL` is saved from `/settings` into `config.json` at runtime.
 
+## Storage Behavior
+
+Message storage depends on where processing happens:
+
+- If `wsgi.py` generates the reply, it is stored in that app's DB (`SQLITE_DB_PATH` for that runtime).
+- If Render bridges to your local `local_fun_bot.py`, the local bot now stores conversation rows in its own SQLite DB (`LOCAL_BOT_SQLITE_DB_PATH` or `SQLITE_DB_PATH`).
+
+Practical impact:
+
+- Render DB and local DB are separate files unless you intentionally point both to shared storage.
+- Seeing `model_used=local_bot` in Render logs means the final reply was produced on your local machine.
+
 ## Model Experience
 
 This is the expected runtime behavior for chat responses:
@@ -113,7 +131,7 @@ This is the expected runtime behavior for chat responses:
 
 - `model_used=openai` when OpenAI succeeds.
 - `model_used=llama` when OpenAI fails and LLaMA succeeds.
-- `model_used=local_bot` only if the whole stateful pipeline crashes and final safety fallback is used.
+- `model_used=local_bot` when `wsgi.py` routes continuity fallback to `local_fun_bot.py` (for example when OpenAI and LLaMA are unavailable on Render).
 - If both OpenAI and LLaMA are unavailable, `USE_LOCAL_FUN_BOT_ON_RULE_BASED=true` allows a final continuity attempt via `LOCAL_FUN_BOT_URL`.
 - `local_fun_bot.py` can also generate LLaMA responses itself and persist them to SQLite when Render forwards fallback traffic.
 
@@ -134,7 +152,7 @@ LIMIT 20;
 1. Create and activate virtual environment:
 
 ```powershell
-cd C:\Users\manis\PycharmProjects\fb_auto_reply_rag
+cd C:\Users\manis\PycharmProjects\fb_auto_reply_rag_vgersion_2
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
@@ -179,7 +197,7 @@ Use these 3 terminals when you want local development only.
 1. Terminal A: run `local_fun_bot.py` on port `5001`
 
 ```powershell
-cd C:\Users\manis\PycharmProjects\fb_auto_reply_rag
+cd C:\Users\manis\PycharmProjects\fb_auto_reply_rag_vgersion_2
 $key = (Get-Content .env | Where-Object { $_ -match '^LOCAL_API_KEY=' } | Select-Object -First 1).Split('=',2)[1]
 $env:LOCAL_API_KEY = $key
 python .\local_fun_bot.py
@@ -188,10 +206,41 @@ python .\local_fun_bot.py
 2. Terminal B: run `wsgi.py` on port `5000`
 
 ```powershell
-cd C:\Users\manis\PycharmProjects\fb_auto_reply_rag
+cd C:\Users\manis\PycharmProjects\fb_auto_reply_rag_vgersion_2
 $env:FLASK_ENV = "development"
 python -m flask --app wsgi.py run --host 0.0.0.0 --port 5000
 ```
+
+## Render To Local Bridge Workflow
+
+Use this when Facebook webhook is on Render but final fallback processing should happen on your local machine.
+
+1. Start local Ollama (`ollama serve`).
+2. Start local bot:
+
+```powershell
+cd C:\Users\manis\PycharmProjects\fb_auto_reply_rag_vgersion_2
+$env:LOCAL_API_KEY="your_shared_key"
+$env:LOCAL_BOT_FORCE_LLAMA="true"
+$env:LOCAL_BOT_PRIMARY_MODEL="llama"
+$env:LOCAL_BOT_USE_FALLBACK="false"
+python local_fun_bot.py
+```
+
+3. Start ngrok for local bot:
+
+```powershell
+ngrok http 5001
+```
+
+4. In Render:
+- set `LOCAL_API_KEY` to the same key,
+- keep `USE_LOCAL_FUN_BOT_ON_RULE_BASED=true`,
+- open `/settings` and save ngrok HTTPS base URL as `NGROK_BASE_URL`.
+
+5. Verify dependencies on Render:
+- `GET /health/dependencies`
+- check `models.local_fun_bot.reachable=true`
 
 3. Terminal C (optional): expose local bot with ngrok
 
@@ -302,7 +351,7 @@ Stop-Process -Id <PID> -Force
 ollama serve
 ```
 
-3. Homepage tester shows echo (`I received: ...`) instead of fun replies
+3. Homepage tester shows echo (`I received: ...`) or generic rule-based reply
    - `local_fun_bot.py` is not reachable.
    - Start local bot on `5001` or set `LOCAL_FUN_BOT_URL`.
 
@@ -327,6 +376,11 @@ ollama serve
 
 8. Facebook webhook receives messages but user gets no reply
    - If logs show `code 190 Invalid OAuth access token`, replace `FB_PAGE_ACCESS_TOKEN` in Render with a valid Page token.
+
+9. Render logs show `model_used=local_bot` but local DB looks empty
+   - Confirm local bot is running updated code from this repo.
+   - Check `LOCAL_BOT_SQLITE_DB_PATH` and query that exact file.
+   - Remember Render DB and local DB are different unless explicitly shared.
 
 ## Security Notes
 
